@@ -28,6 +28,7 @@ target_include_directories(ivory PUBLIC ${CMAKE_SOURCE_DIR}/ivory)
 if(NOT IS_DIRECTORY ${libOTe_Dirs}) 
   message(FATAL_ERROR "Bad libOTe location. libOTe_Dirs=${libOTe_Dirs}" )
 endif()
+#message(STATUS "checking ${libOTe_Dirs} for libOTe")
 
 
 find_library(

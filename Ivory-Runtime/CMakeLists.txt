@@ -23,6 +23,8 @@ set(CMAKE_CXX_FLAGS  "${CMAKE_C_FLAGS}  -std=c++14")
 
 # default location for libOTe
 set(libOTe_Dirs "${CMAKE_SOURCE_DIR}/../libOTe/")
+#message(STATUS "binary dir ${CMAKE_BINARY_DIR}")
+#set(libOTe_Dirs "${CMAKE_BINARY_DIR}/../libOTe/")
 #include_directories("${libOTe_Dirs}/libOTe/") 
 #link_directories("${libOTe_Dirs}/lib/")
 

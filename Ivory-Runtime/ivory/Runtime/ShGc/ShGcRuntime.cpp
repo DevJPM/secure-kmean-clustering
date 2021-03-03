@@ -1,10 +1,13 @@
+#include <immintrin.h>
+#include <iostream>
+
 #include "ShGcRuntime.h"
 #include "ivory/Runtime/ShGc/ShGcInt.h"
-
 
 #include "cryptoTools/Common/Log.h"
 
 #include "libOTe/Base/naor-pinkas.h"
+
 namespace osuCrypto
 {
 
@@ -26,7 +29,7 @@ namespace osuCrypto
 	}
 
 
-	void ShGcRuntime::init(Channel & chl, block seed, Role role, u64 partyIdx)
+	void ShGcRuntime::init(Channel& chl, block seed, Role role, u64 partyIdx)
 	{
 		mPrng.SetSeed(seed);
 		mAes.setKey(mPrng.get<block>());
@@ -61,7 +64,7 @@ namespace osuCrypto
 		return ShGc::GarbledMem(new std::vector<block>(size));
 	}
 
-	void ShGcRuntime::freeMem(const ShGc::GarbledMem & mem)
+	void ShGcRuntime::freeMem(const ShGc::GarbledMem& mem)
 	{
 	}
 
@@ -267,17 +270,17 @@ namespace osuCrypto
 		return ret;
 	}
 
-	void ShGcRuntime::enqueue(ShGc::InputItem && item)
+	void ShGcRuntime::enqueue(ShGc::InputItem&& item)
 	{
 		mInputQueue.emplace(std::move(item));
 	}
 
-	void ShGcRuntime::enqueue(ShGc::CircuitItem && item)
+	void ShGcRuntime::enqueue(ShGc::CircuitItem&& item)
 	{
 		mCrtQueue.emplace(std::move(item));
 	}
 
-	void ShGcRuntime::enqueue(ShGc::OutputItem && item)
+	void ShGcRuntime::enqueue(ShGc::OutputItem&& item)
 	{
 		mOutputQueue.emplace(std::move(item));
 	}
@@ -431,7 +434,7 @@ namespace osuCrypto
 				garble(*item.mCircuit, sharedMem, mTweaks, gates, mZeroAndGlobalOffset, shareAuxBits);
 				if (item.mCircuit->mNonXorGateCount) mChannel->asyncSend(std::move(gates));
 				for (auto bit : shareAuxBits)
-					mChannel->asyncSendCopy(&bit,1);
+					mChannel->asyncSendCopy(&bit, 1);
 				shareAuxBits.clear();
 
 				for (u64 i = item.mInputBundleCount; i < item.mLabels.size(); ++i) {
@@ -539,7 +542,7 @@ namespace osuCrypto
 					Expects(sharedBuff.size() == item.mCircuit->mNonXorGateCount * 2);
 				}
 				auto gates = span<GarbledGate<2>>(
-					(GarbledGate<2>*) sharedBuff.data(), 
+					(GarbledGate<2>*) sharedBuff.data(),
 					item.mCircuit->mNonXorGateCount);
 
 				evaluate(*item.mCircuit, sharedMem, mTweaks, gates, mRecvBit);
@@ -670,7 +673,7 @@ namespace osuCrypto
 		}
 	}
 
-	bool ShGcRuntime::isConstLabel(const block & b)
+	bool ShGcRuntime::isConstLabel(const block& b)
 	{
 		return eq(mPublicLabels[0], b) || eq(mPublicLabels[1], b);
 	}
@@ -747,9 +750,197 @@ namespace osuCrypto
 		}
 	}
 
+	
+	namespace { // tell the compiler that this is a local class, perfectly suited for inlining!
+		class DynamicScheduler {
+		public:
+			void enqueue(BetaGate item) { queue.push_back(item); }
+			bool traps(const BetaGate& gateIn) {
+				bool enableRight = gateIn.mType != GateType::a;
+				for (const auto& item : queue) {
+					if (gateIn.mInput[0] == item.mOutput || (enableRight && gateIn.mInput[1] == item.mOutput))
+						return true;
+				}
+
+				return false;
+			}
+			const std::vector<BetaGate>& getQueue() { return queue; }
+			void clearQueue() { queue.clear(); }
 
 
+		private:
+			std::vector<BetaGate> queue;
+		};
 
+		__attribute__((target("avx512f,vaes,avx512vl")))
+		static __m512i inserter(__m512i base, __m128i data, u8 pos) {
+			switch (pos & 0x03) {
+			case 0:
+				return _mm512_inserti32x4(base, data, 0);
+			case 1:
+				return _mm512_inserti32x4(base, data, 1);
+			case 2:
+				return _mm512_inserti32x4(base, data, 2);
+			case 3:
+				return _mm512_inserti32x4(base, data, 3);
+			}
+		}
+
+		__attribute__((target("avx512f,vaes,avx512vl")))
+			static __m128i extractor(__m512i base, u8 pos) {
+			switch (pos & 0x03) {
+			case 0:
+				return _mm512_extracti32x4_epi32(base, 0);
+			case 1:
+				return _mm512_extracti32x4_epi32(base, 1);
+			case 2:
+				return _mm512_extracti32x4_epi32(base, 2);
+			case 3:
+				return _mm512_extracti32x4_epi32(base, 3);
+			}
+		}
+		
+		template<size_t WIDTH>
+		static __attribute__((target("avx512f,vaes,avx512vl")))
+			void EvaluateANDGates(
+				const std::vector<BetaGate>& queue,
+				const span<block>& wires,
+				std::array<block, 2>& tweaks,
+				span<GarbledGate<2>>::iterator& garbledGateIter
+			)
+		{
+			//constexpr size_t WIDTH = 8;
+			static_assert(WIDTH % 4 == 0, "requires width multiple of 4");
+			constexpr size_t NUM_REGISTERS = WIDTH / 2;
+			constexpr size_t NUM_MASKS = WIDTH / 4;
+
+			const __m512i base_offset = _mm512_set_epi64(0, 3, 0, 2, 0, 1, 0, 0);
+			const __m512i additive_offset = _mm512_set_epi64(0, 4, 0, 4, 0, 4, 0, 4);
+
+			__m512i data[NUM_REGISTERS];
+			__m512i whitening[NUM_REGISTERS];
+			__m128i* targetGateKey[WIDTH];
+			__m512i postMask[NUM_MASKS];
+
+			__m512i keys[11];
+			for (size_t i = 0; i < 11; ++i)
+				keys[i] = _mm512_broadcast_i32x4(mAesFixedKey.mRoundKey[i]);
+
+			//std::cout << "post-key load" << std::endl;
+
+			__m512i wideTweaks[2];
+			for (size_t i = 0; i < 2; ++i) {
+				wideTweaks[i] = _mm512_broadcast_i32x4(tweaks[i]);
+				wideTweaks[i] = _mm512_add_epi64(wideTweaks[i], base_offset);
+			}
+
+			//std::cout << "post-tweak load" << std::endl;
+
+			for (size_t progress = 0; progress < queue.size(); ) {
+				const size_t batch_size = std::min(WIDTH, queue.size() - progress);
+				__mmask8 processing_masks[NUM_MASKS];
+				{
+					size_t vals_left = batch_size;
+					for (size_t r = 0; r < NUM_MASKS; ++r) {
+						processing_masks[r] = vals_left >= 4 ? 0xFF : ((1 << (2 * vals_left)) - 1);
+						//if (processing_masks[r] == 1)
+						//	std::cout << "WTF, mask was 1, " << vals_left << " was vals_left" << std::endl;
+						//std::cout << "mask #" << r << " is " << (short) processing_masks[r] << std::endl;
+						vals_left -= std::min(size_t(4), vals_left);
+						
+					}
+				}
+				//std::cout << "post-mask gen, queue size = "<< queue.size() << std::endl;
+				//std::cout << "progress = " << progress << std::endl;
+
+				__m128i* tableptr = nullptr; // safe whenever we actually access it
+
+				for (size_t r = 0; r < NUM_MASKS; ++r) {
+					for (size_t l = 0; l < 4; ++l) {
+						const size_t currentQueuePos = progress + 4 * r + l;
+						const __mmask8 pmask = (processing_masks[r] >> (2*l)) & 0x03;
+						const BetaGate gate = queue[std::min(queue.size()-1, currentQueuePos)];
+						__m128i lleft = _mm_maskz_load_epi64(pmask, wires.data() + gate.mInput[0]);
+						__m128i lright = _mm_maskz_load_epi64(pmask, wires.data() + gate.mInput[1]);
+						targetGateKey[4 * r + l] = wires.data() + gate.mOutput;
+						//std::cout << "post-gate loads" << std::endl;
+
+						const u8 lpb = _mm_extract_epi8(lleft, 0) & 1;
+						const __mmask8 lpm = (lpb << 1) | lpb;
+						const u8 rpb = _mm_extract_epi8(lright, 0) & 1;
+						const __mmask8 rpm = (rpb << 1) | rpb;				
+						
+						//std::cout << "post iter access" << std::endl;
+						if (currentQueuePos < queue.size())
+						{
+							auto& garbledTable = garbledGateIter->mGarbledTable;
+							tableptr = garbledTable.data();
+							garbledGateIter++;
+						}
+						//std::cout << "post-iter increment" << std::endl;
+						__m128i firstTable = _mm_maskz_load_epi64(pmask & lpm, tableptr);
+						__m128i secondTable = _mm_maskz_load_epi64(pmask & rpm, tableptr + 1);
+						secondTable = _mm_maskz_xor_epi64(rpm, lleft, secondTable);
+						__m128i lmask = _mm_xor_si128(firstTable, secondTable);
+						//std::cout << "post-table loads" << std::endl;
+
+						data[2 * r] = inserter(data[2 * r], lleft, l);
+						data[2 * r + 1] = inserter(data[2 * r + 1], lright, l);
+						postMask[r] = inserter(postMask[r], lmask, l);
+						//std::cout << "post-insertions" << std::endl;
+					}
+
+					//std::cout << "pre wide preprocessing" << std::endl;
+
+					// post insertions
+
+					
+					//std::cout << "post preprocessing" << std::endl;
+				}
+
+				for (size_t w=0; w < NUM_REGISTERS; ++w) {
+					data[w] = _mm512_slli_epi64(data[w], 1);
+					data[w] = _mm512_xor_si512(data[w], wideTweaks[w%2]);
+					wideTweaks[w%2] = _mm512_add_epi64(wideTweaks[w%2], additive_offset);
+					whitening[w] = data[w];
+					data[w] = _mm512_xor_si512(data[w], keys[0]);
+				}
+
+				for (size_t r = 1; r < 10; ++r)
+					for (size_t w = 0; w < NUM_REGISTERS; ++w)
+						data[w] = _mm512_aesenc_epi128(data[w], keys[r]);
+				for (size_t w = 0; w < NUM_REGISTERS; ++w) {
+					data[w] = _mm512_aesenclast_epi128(data[w], keys[10]);
+					data[w] = _mm512_xor_si512(data[w], whitening[w]);
+				}
+				//std::cout << "post AES" << std::endl;
+
+				for (size_t r = 0; r < NUM_MASKS; ++r) {
+					__m512i combined = _mm512_xor_si512(data[2 * r], data[2 * r + 1]);
+					combined = _mm512_xor_si512(combined, postMask[r]);
+					//std::cout << "post wide postprocessing" << std::endl;
+					for (size_t l = 0; l < 4; ++l) {
+						const __m128i extracted = extractor(combined, l);
+						//bool bad = (progress + 4 * r + l >= queue.size()) && (((processing_masks[r] >> (2 * l)) & 0x03) != 0);
+						//if (bad)
+						//	std::cout << "dodo, mask was "<<(short)(processing_masks[r] >> (2 * l)) << std::endl;
+						//if(progress +4*r+l<queue.size())
+							_mm_mask_store_epi64(targetGateKey[4 * r + l], processing_masks[r] >> (2 * l), extracted);
+						
+					}
+					//std::cout << "post store" << std::endl;
+				}
+
+				progress += batch_size;
+			}
+
+			const __m128i tweak_diff = _mm_set_epi64x(0, queue.size());
+			tweaks[0] += tweak_diff;
+			tweaks[1] += tweak_diff;
+			//std::cout << "post-tweak write" << std::endl;
+		}
+		
+	}
 
 	void ShGcRuntime::evaluate(
 		const BetaCircuit & cir,
@@ -770,13 +961,21 @@ namespace osuCrypto
 			zeroAndGarbledTable[2][2]
 		{ { ZeroBlock,ZeroBlock },{ ZeroBlock,ZeroBlock } };
 
+		DynamicScheduler scheduler;
+
 		for (const auto& gate : cir.mGates)
 		{
 
 			auto& gt = gate.mType;
 
 
-
+			if (scheduler.traps(gate)) {
+				if(scheduler.getQueue().size() > 4)
+					EvaluateANDGates<8>(scheduler.getQueue(), wires, tweaks, garbledGateIter);
+				else
+					EvaluateANDGates<4>(scheduler.getQueue(), wires, tweaks, garbledGateIter);
+				scheduler.clearQueue();
+			}
 
 			if (GSL_LIKELY(gt != GateType::a))
 			{
@@ -786,6 +985,7 @@ namespace osuCrypto
 				auto constA = isConstLabel(a);
 				auto constB = isConstLabel(b);
 				auto constAB = constA || constB;
+				
 
 				if (GSL_LIKELY(!constAB))
 				{
@@ -807,8 +1007,9 @@ namespace osuCrypto
 					}
 					else
 					{
+						scheduler.enqueue(gate);
 						// compute the hashs
-						hashs[0] = _mm_slli_epi64(a, 1) ^ tweaks[0];
+						/*hashs[0] = _mm_slli_epi64(a, 1) ^ tweaks[0];
 						hashs[1] = _mm_slli_epi64(b, 1) ^ tweaks[1];
 						mAesFixedKey.ecbEncTwoBlocks(hashs, temp);
 						hashs[0] = temp[0] ^ hashs[0];
@@ -826,7 +1027,7 @@ namespace osuCrypto
 						c = hashs[0] ^
 							hashs[1] ^
 							zeroAndGarbledTable[PermuteBit(a)][0] ^
-							zeroAndGarbledTable[PermuteBit(b)][1];
+							zeroAndGarbledTable[PermuteBit(b)][1];*/
 
 						//std::cout  << "e " << i++ << gateToString(gate.mType) << std::endl <<
 						//    " gt  " << garbledTable[0] << "  " << garbledTable[1] << std::endl <<
@@ -868,6 +1069,12 @@ namespace osuCrypto
 				memcpy(&*(wires.begin() + dest), &*(wires.begin() + src), i32(len * sizeof(block)));
 			}
 		}
+
+		if (scheduler.getQueue().size() > 4)
+			EvaluateANDGates<8>(scheduler.getQueue(), wires, tweaks, garbledGateIter);
+		else
+			EvaluateANDGates<4>(scheduler.getQueue(), wires, tweaks, garbledGateIter);
+		scheduler.clearQueue();
 
 		//std::cout  << IoStream::unlock;
 		for (u64 i = 0; i < cir.mOutputs.size(); ++i)

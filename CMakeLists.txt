@@ -20,7 +20,7 @@ if("${CMAKE_CURRENT_SOURCE_DIR}" STREQUAL "${CMAKE_SOURCE_DIR}")
 	set(CMAKE_CXX_FLAGS  "${CMAKE_C_FLAGS}  -std=c++14")
 	
 	# Select flags.
-	SET(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG") 
+	SET(CMAKE_CXX_FLAGS_RELEASE "-O3 -g -DNDEBUG") 
 	SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO " -O2 -g -ggdb -rdynamic")
 	SET(CMAKE_CXX_FLAGS_DEBUG  "-O0 -g -ggdb -rdynamic")
 	
@@ -57,9 +57,12 @@ endif()
 
 # default location for libOTe
 set(libOTe_Dirs "${CMAKE_SOURCE_DIR}/libOTe/")
+#set(libOTe_Dirs "${CMAKE_BINARY_DIR}/libOTe/")
 
 # default location for NTL
 set(NTL_Dirs "${CMAKE_SOURCE_DIR}/Ivory-Runtime/thirdparty/linux/ntl/")
+
+
 
 
 #############################################

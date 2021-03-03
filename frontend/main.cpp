@@ -2157,13 +2157,13 @@ int main(int argc, char** argv)
 					{
 						numInteration = T;
 						//	boost::this_thread::sleep(boost::posix_time::seconds(2));
-						party0_Dist();
+						//party0_Dist();
 						//party0_DistNorm(1);
 						//party0_DistNorm(0);
 						//party0_Min();
 						//party0_Min_BaseLine();
 						//party0_UpdateCluster();
-						//party0_Clustering();
+						party0_Clustering();
 					}
 				}
 			}
@@ -2189,13 +2189,13 @@ int main(int argc, char** argv)
 					{
 						numInteration = T;
 						//boost::this_thread::sleep(boost::posix_time::seconds(2));
-						party1_Dist();
+						//party1_Dist();
 						//party1_DistNorm(1);
 						//party1_DistNorm(0);
 						//party1_Min();
 						//party1_Min_BaseLine();
 						//party1_UpdateCluster();
-						//party1_Clustering();
+						party1_Clustering();
 
 
 					}
